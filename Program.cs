@@ -1,143 +1,153 @@
-﻿
-using Amazon.S3;
+﻿using Amazon.S3;
 using Amazon.S3.Model;
-using Npgsql;
+using Microsoft.EntityFrameworkCore;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using VideoProcessWorker.Models;
 
-Console.WriteLine("🎬 Video Processor Worker Started...");
+await Main();
 
-// RabbitMQ Setup
-var factory = new ConnectionFactory()
+async Task Main()
 {
-    HostName = "localhost",
-    UserName = "guest",
-    Password = "guest",
-    Port = 5672
-};
+    Console.WriteLine("🎬 Video Processor Worker Started...");
 
-using var connection = await factory.CreateConnectionAsync();
-using var channel = await connection.CreateChannelAsync();
-
-await channel.QueueDeclareAsync(queue: "video-processing",
-                     durable: true,
-                     exclusive: false,
-                     autoDelete: false,
-                     arguments: null);
-
-// MinIO (S3-compatible) setup
-var s3 = new AmazonS3Client("minioadmin", "minioadmin", new AmazonS3Config
-{
-    ServiceURL = "http://localhost:9000",
-    ForcePathStyle = true,
-    UseHttp = true
-});
-
-// PostgreSQL setup
-var connStr = "Host=localhost;Port=5432;Database=sdlearner;Username=postgres;Password=localdev";
-await using var db = new NpgsqlConnection(connStr);
-await db.OpenAsync();
-
-var consumer = new AsyncEventingBasicConsumer(channel);
-
-consumer.ReceivedAsync += async (model, ea) =>
-{
-    var body = ea.Body.ToArray();
-    var message = Encoding.UTF8.GetString(body);
-
-    try
+    var s3 = new AmazonS3Client("minioadmin", "minioadmin", new AmazonS3Config
     {
+        ServiceURL = "http://localhost:9000",
+        ForcePathStyle = true,
+        UseHttp = true
+    });
+
+    var factory = new ConnectionFactory() { HostName = "localhost" };
+    using var connection = await factory.CreateConnectionAsync();
+    using var channel = await connection.CreateChannelAsync();
+
+    await channel.QueueDeclareAsync("video-processing", durable: true, exclusive: false, autoDelete: false);
+
+    var consumer = new AsyncEventingBasicConsumer(channel);
+    consumer.ReceivedAsync += async (model, ea) =>
+    {
+        var message = Encoding.UTF8.GetString(ea.Body.ToArray());
         var payload = JsonSerializer.Deserialize<VideoMessage>(message);
-        var videoId = payload?.videoId;
 
-        Console.WriteLine($"📥 Received videoId: {videoId}");
+        Console.WriteLine($"📥 Processing videoId: {payload.videoId}");
 
-        // Fetch video metadata from DB
-        var cmd = new NpgsqlCommand("SELECT * FROM \"Videos\" WHERE \"Id\" = @id", db);
-        cmd.Parameters.AddWithValue("id", Guid.Parse(videoId));
-        await using var reader = await cmd.ExecuteReaderAsync();
-
-        if (!reader.Read())
+        using var db = new AppDbContext();
+        var video = await db.Videos.FirstOrDefaultAsync(v => v.Id.ToString() == payload.videoId);
+        if (video == null)
         {
-            Console.WriteLine("❌ Video not found in database.");
+            Console.WriteLine("❌ Video not found");
             return;
         }
 
-        var fileName = reader.GetString(reader.GetOrdinal("filename"));
-        var userId = reader.GetString(reader.GetOrdinal("userid"));
-        await reader.CloseAsync();
+        var root = Directory.GetCurrentDirectory();
+        var tempRawDir = Path.Combine(root, "temp", "raw", payload.videoId);
+        var tempProcessedDir = Path.Combine(root, "temp", "processed", payload.videoId);
+        Directory.CreateDirectory(tempRawDir);
+        Directory.CreateDirectory(tempProcessedDir);
 
-        // Build S3 keys and paths
-        var rawKey = $"{userId}/{videoId}/{fileName}";
-        var processedFileName = Path.GetFileNameWithoutExtension(fileName) + "_processed.mp4";
-        var rawPath = Path.Combine("temp/raw", fileName);
-        var processedPath = Path.Combine("temp/processed", processedFileName);
+        var inputPath = Path.Combine(tempRawDir, video.FileName);
+        var getRequest = new GetObjectRequest { BucketName = "raw-uploads", Key = video.S3Key };
+        using (var response = await s3.GetObjectAsync(getRequest))
+        using (var fs = new FileStream(inputPath, FileMode.Create))
+            await response.ResponseStream.CopyToAsync(fs);
 
-        // Download raw video from MinIO
-        Console.WriteLine("⬇️  Downloading raw video...");
-        var getReq = new GetObjectRequest
-        {
-            BucketName = "raw-uploads",
-            Key = rawKey
+        var thumbnailPath = Path.Combine(tempProcessedDir, "thumb.jpg");
+        var video480p = Path.Combine(tempProcessedDir, "video_480p.mp4");
+        var video720p = Path.Combine(tempProcessedDir, "video_720p.mp4");
+
+
+        var ffmpegTasks = new[]
+               {
+            new { Cmd = $"-threads 2 -ss 00:00:05 -i \"{inputPath}\" -vframes 1 -q:v 2 \"{thumbnailPath}\"" },
+            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:480 \"{video480p}\"" },
+            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"" }
         };
 
-        using var s3Response = await s3.GetObjectAsync(getReq);
-        await using (var fs = File.Create(rawPath))
+        await Parallel.ForEachAsync(ffmpegTasks, async (task, _) =>
         {
-            await s3Response.ResponseStream.CopyToAsync(fs);
+            RunFFmpeg(task.Cmd);
+        });
+        // RunFFmpeg($"-ss 00:00:05 -i \"{inputPath}\" -vframes 1 -q:v 2 \"{thumbnailPath}\"");
+        // RunFFmpeg($"-i \"{inputPath}\" -vf scale=-2:480 \"{video480p}\"");
+        // RunFFmpeg($"-i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"");
+
+        async Task UploadFile(string path, string bucket, string key)
+        {
+            using var fs = new FileStream(path, FileMode.Open);
+            var putReq = new PutObjectRequest
+            {
+                BucketName = bucket,
+                Key = key,
+                InputStream = fs
+            };
+            await s3.PutObjectAsync(putReq);
         }
 
-        // Process with FFmpeg
-        Console.WriteLine("🎞️  Processing video with FFmpeg...");
-        var ff = Process.Start(new ProcessStartInfo
+        var baseKey = $"{video.UserId}/{payload.videoId}";
+        await UploadFile(thumbnailPath, "processed-videos", $"{baseKey}/thumb.jpg");
+        await UploadFile(video480p, "processed-videos", $"{baseKey}/video_480p.mp4");
+        await UploadFile(video720p, "processed-videos", $"{baseKey}/video_720p.mp4");
+
+        video.ThumbnailUrl = $"processed-videos/{baseKey}/thumb.jpg";
+        video.Video480pUrl = $"processed-videos/{baseKey}/video_480p.mp4";
+        video.Video720pUrl = $"processed-videos/{baseKey}/video_720p.mp4";
+        video.Status = "processed";
+        await db.SaveChangesAsync();
+
+        try
+        {
+            Directory.Delete(tempRawDir, true);
+            Directory.Delete(tempProcessedDir, true);
+        }
+        catch (Exception cleanupEx)
+        {
+            Console.WriteLine($"⚠️ Cleanup failed: {cleanupEx.Message}");
+        }
+
+        Console.WriteLine("✅ Video processed & uploaded");
+    };
+
+    await channel.BasicConsumeAsync(queue: "video-processing", autoAck: true, consumer: consumer);
+    Console.WriteLine("📡 Worker running... Press [enter] to exit.");
+    Console.ReadLine();
+}
+
+// ---------- Support classes and methods ----------
+
+string RunFFmpeg(string args)
+{
+    var sw = Stopwatch.StartNew();
+    var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
         {
             FileName = "ffmpeg",
-            Arguments = $"-i \"{rawPath}\" -c:v libx264 -preset fast \"{processedPath}\" -y",
+            Arguments = args,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            UseShellExecute = false
-        });
-
-        ff.WaitForExit();
-
-        if (ff.ExitCode != 0)
-        {
-            Console.WriteLine("❌ FFmpeg failed.");
-            return;
+            UseShellExecute = false,
+            CreateNoWindow = true
         }
+    };
+    process.Start();
+    process.WaitForExit();
 
-        // Upload processed video to MinIO
-        Console.WriteLine("⬆️  Uploading processed video...");
-        await using var uploadStream = File.OpenRead(processedPath);
-        await s3.PutObjectAsync(new PutObjectRequest
-        {
-            BucketName = "processed-videos",
-            Key = $"{userId}/{videoId}/{processedFileName}",
-            InputStream = uploadStream,
-            ContentType = "video/mp4"
-        });
+    sw.Stop();
 
-        // Update DB
-        var updateCmd = new NpgsqlCommand("UPDATE \"Videos\" SET \"Status\" = 'processed' WHERE \"Id\" = @id", db);
-        updateCmd.Parameters.AddWithValue("id", Guid.Parse(videoId));
-        await updateCmd.ExecuteNonQueryAsync();
+    Console.WriteLine($"⏱ FFmpeg finished in {sw.Elapsed.TotalSeconds:F2} seconds for: {args}");
+    return process.StandardError.ReadToEnd();
+}
 
-        Console.WriteLine($"✅ Video {videoId} processed and uploaded.");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"❌ Error: {ex.Message}");
-    }
-};
 
-await channel.BasicConsumeAsync(queue: "video-processing",
-                     autoAck: true,
-                     consumer: consumer);
 
-Console.WriteLine("📡 Listening for messages. Press [enter] to exit.");
-Console.ReadLine();
+public class AppDbContext : DbContext
+{
+    public DbSet<VideoMetadata> Videos { get; set; }
 
+    protected override void OnConfiguring(DbContextOptionsBuilder options)
+        => options.UseNpgsql("Host=localhost;Username=postgres;Password=localdev;Database=sdlearner");
+}
