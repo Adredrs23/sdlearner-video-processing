@@ -7,21 +7,37 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using VideoProcessWorker.Models;
+using DotNetEnv;
+using Microsoft.Extensions.Configuration;
+
+Env.Load();
 
 await Main();
 
 async Task Main()
 {
+
+    var config = new ConfigurationBuilder()
+        .AddEnvironmentVariables()
+        .Build();
+
     Console.WriteLine("🎬 Video Processor Worker Started...");
 
-    var s3 = new AmazonS3Client("minioadmin", "minioadmin", new AmazonS3Config
+    var s3 = new AmazonS3Client(config["Minio:AccessKey"], config["Minio:SecretKey"], new AmazonS3Config
     {
-        ServiceURL = "http://localhost:9000",
+        ServiceURL = config["Minio:Endpoint"] ?? "http://localhost:9000",
         ForcePathStyle = true,
         UseHttp = true
     });
 
-    var factory = new ConnectionFactory() { HostName = "localhost" };
+    // var factory = new ConnectionFactory() { HostName = "localhost" };
+    var factory = new ConnectionFactory()
+    {
+        HostName = config["RabbitMQ:HostName"] ?? "localhost",
+        UserName = config["RabbitMQ:UserName"] ?? "Guest",
+        Password = config["RabbitMQ:Password"] ?? "Guest",
+        Port = int.Parse(config["RabbitMQ:Port"] ?? "5672")
+    };
     using var connection = await factory.CreateConnectionAsync();
     using var channel = await connection.CreateChannelAsync();
 
@@ -35,7 +51,7 @@ async Task Main()
 
         Console.WriteLine($"📥 Processing videoId: {payload.videoId}");
 
-        using var db = new AppDbContext();
+        using var db = new AppDbContext(config);
         var video = await db.Videos.FirstOrDefaultAsync(v => v.Id.ToString() == payload.videoId);
         if (video == null)
         {
@@ -61,7 +77,7 @@ async Task Main()
 
 
         var ffmpegTasks = new[]
-               {
+        {
             new { Cmd = $"-threads 2 -ss 00:00:05 -i \"{inputPath}\" -vframes 1 -q:v 2 \"{thumbnailPath}\"" },
             new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:480 \"{video480p}\"" },
             new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"" }
@@ -144,10 +160,26 @@ string RunFFmpeg(string args)
 
 
 
+// public class AppDbContext : DbContext
+// {
+//     public DbSet<VideoMetadata> Videos { get; set; }
+
+//     protected override void OnConfiguring(DbContextOptionsBuilder options)
+//         => options.UseNpgsql(config["ConnectionStrings:DefaultConnection"]);
+// }
+
+
 public class AppDbContext : DbContext
 {
+    private readonly IConfiguration _config;
+
     public DbSet<VideoMetadata> Videos { get; set; }
 
+    public AppDbContext(IConfiguration config)
+    {
+        _config = config;
+    }
+
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseNpgsql("Host=localhost;Username=postgres;Password=localdev;Database=sdlearner");
+        => options.UseNpgsql(_config.GetConnectionString("DefaultConnection"));
 }
