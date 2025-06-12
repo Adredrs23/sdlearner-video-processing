@@ -28,9 +28,15 @@ public class VideoMetadata
     [Column("thumbnail_url")]
     public string? ThumbnailUrl { get; set; }
 
-    [Column("video_480p_url")]
-    public string? Video480pUrl { get; set; }
+    [Column("video_1080p_url")]
+    public string? Video1080pUrl { get; set; }
 
     [Column("video_720p_url")]
     public string? Video720pUrl { get; set; }
+
+    [Column("video_480p_url")]
+    public string? Video480pUrl { get; set; }
+
+    [Column("video_144p_url")]
+    public string? Video144pUrl { get; set; }
 }

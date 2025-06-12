@@ -72,24 +72,25 @@ async Task Main()
             await response.ResponseStream.CopyToAsync(fs);
 
         var thumbnailPath = Path.Combine(tempProcessedDir, "thumb.jpg");
-        var video480p = Path.Combine(tempProcessedDir, "video_480p.mp4");
+        var video1080p = Path.Combine(tempProcessedDir, "video_1080p.mp4");
         var video720p = Path.Combine(tempProcessedDir, "video_720p.mp4");
+        var video480p = Path.Combine(tempProcessedDir, "video_480p.mp4");
+        var video144p = Path.Combine(tempProcessedDir, "video_144p.mp4");
 
 
         var ffmpegTasks = new[]
         {
             new { Cmd = $"-threads 2 -ss 00:00:05 -i \"{inputPath}\" -vframes 1 -q:v 2 \"{thumbnailPath}\"" },
+            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:1080 \"{video1080p}\"" },
+            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"" },
             new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:480 \"{video480p}\"" },
-            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"" }
+            new { Cmd = $"-threads 2 -i \"{inputPath}\" -vf scale=-2:144 \"{video144p}\"" }
         };
 
         await Parallel.ForEachAsync(ffmpegTasks, async (task, _) =>
         {
             RunFFmpeg(task.Cmd);
         });
-        // RunFFmpeg($"-ss 00:00:05 -i \"{inputPath}\" -vframes 1 -q:v 2 \"{thumbnailPath}\"");
-        // RunFFmpeg($"-i \"{inputPath}\" -vf scale=-2:480 \"{video480p}\"");
-        // RunFFmpeg($"-i \"{inputPath}\" -vf scale=-2:720 \"{video720p}\"");
 
         async Task UploadFile(string path, string bucket, string key)
         {
@@ -105,12 +106,16 @@ async Task Main()
 
         var baseKey = $"{video.UserId}/{payload.videoId}";
         await UploadFile(thumbnailPath, "processed-videos", $"{baseKey}/thumb.jpg");
-        await UploadFile(video480p, "processed-videos", $"{baseKey}/video_480p.mp4");
+        await UploadFile(video1080p, "processed-videos", $"{baseKey}/video_1080p.mp4");
         await UploadFile(video720p, "processed-videos", $"{baseKey}/video_720p.mp4");
+        await UploadFile(video480p, "processed-videos", $"{baseKey}/video_480p.mp4");
+        await UploadFile(video144p, "processed-videos", $"{baseKey}/video_144p.mp4");
 
         video.ThumbnailUrl = $"processed-videos/{baseKey}/thumb.jpg";
-        video.Video480pUrl = $"processed-videos/{baseKey}/video_480p.mp4";
+        video.Video1080pUrl = $"processed-videos/{baseKey}/video_1080p.mp4";
         video.Video720pUrl = $"processed-videos/{baseKey}/video_720p.mp4";
+        video.Video480pUrl = $"processed-videos/{baseKey}/video_480p.mp4";
+        video.Video144pUrl = $"processed-videos/{baseKey}/video_144p.mp4";
         video.Status = "processed";
         await db.SaveChangesAsync();
 
@@ -158,15 +163,6 @@ string RunFFmpeg(string args)
     return process.StandardError.ReadToEnd();
 }
 
-
-
-// public class AppDbContext : DbContext
-// {
-//     public DbSet<VideoMetadata> Videos { get; set; }
-
-//     protected override void OnConfiguring(DbContextOptionsBuilder options)
-//         => options.UseNpgsql(config["ConnectionStrings:DefaultConnection"]);
-// }
 
 
 public class AppDbContext : DbContext
